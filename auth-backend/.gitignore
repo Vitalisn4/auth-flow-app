@@ -1,0 +1,6 @@
+/target
+.env
+auth.db*
+uploads/
+*.log
+.DS_Store
