@@ -15,10 +15,10 @@ interface AuthContextType extends AuthState {
 
 type AuthAction =
   | { type: 'SET_LOADING'; payload: boolean }
-  | { type: 'LOGIN_SUCCESS'; payload: { user: User; token: string; refreshToken: string; expiresIn: number } }
+  | { type: 'LOGIN_SUCCESS'; payload: { user: User; token: string; refreshToken: string } }
   | { type: 'LOGOUT' }
   | { type: 'UPDATE_USER'; payload: Partial<User> }
-  | { type: 'SET_SESSION_EXPIRY'; payload: number };
+  | { type: 'SET_SESSION_EXPIRY'; payload: number | null };
 
 const initialState: AuthState = {
   user: null,
@@ -29,11 +29,25 @@ const initialState: AuthState = {
   sessionExpiry: null,
 };
 
+function getJwtExpiry(token: string): number | null {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    return payload.exp * 1000;
+  } catch {
+    return null;
+  }
+}
+
+function isJwtExpired(token: string): boolean {
+  const expiry = getJwtExpiry(token);
+  if (!expiry) return true;
+  return expiry < Date.now();
+}
+
 function authReducer(state: AuthState, action: AuthAction): AuthState {
   switch (action.type) {
     case 'SET_LOADING':
       return { ...state, isLoading: action.payload };
-    
     case 'LOGIN_SUCCESS':
       return {
         ...state,
@@ -42,33 +56,27 @@ function authReducer(state: AuthState, action: AuthAction): AuthState {
         refreshToken: action.payload.refreshToken,
         isAuthenticated: true,
         isLoading: false,
-        sessionExpiry: Date.now() + action.payload.expiresIn,
+        sessionExpiry: getJwtExpiry(action.payload.token),
       };
-    
     case 'LOGOUT':
       return {
         ...initialState,
         isLoading: false,
       };
-    
     case 'UPDATE_USER':
       return {
         ...state,
         user: state.user ? { ...state.user, ...action.payload } : null,
       };
-    
     case 'SET_SESSION_EXPIRY':
       return {
         ...state,
         sessionExpiry: action.payload,
       };
-    
     default:
       return state;
   }
 }
-
-export const AuthContext = createContext<AuthContextType | null>(null);
 
 interface AuthProviderProps {
   children: ReactNode;
@@ -77,27 +85,58 @@ interface AuthProviderProps {
 export function AuthProvider({ children }: AuthProviderProps) {
   const [state, dispatch] = useReducer(authReducer, initialState);
 
-  // Initialize auth state from storage
+  // Initialize auth state from storage and refresh token if needed
   useEffect(() => {
     const initializeAuth = async () => {
       try {
         const token = authService.getStoredToken();
         const refreshToken = authService.getStoredRefreshToken();
         const user = authService.getStoredUser();
+        console.log('Token:', token);
+        console.log('RefreshToken:', refreshToken);
+        console.log('User:', user);
 
         if (token && refreshToken && user) {
-          dispatch({
-            type: 'LOGIN_SUCCESS',
-            payload: {
-              user,
-              token,
-              refreshToken,
-              expiresIn: AUTH_CONFIG.SESSION_DURATION,
-            },
-          });
+          const expired = isJwtExpired(token);
+          console.log('Is token expired?', expired);
+          if (expired) {
+            // Try to refresh the token
+            try {
+              const response = await authService.refreshToken(refreshToken);
+              storage.set(AUTH_CONFIG.TOKEN_KEY, response.token);
+              storage.set(AUTH_CONFIG.REFRESH_TOKEN_KEY, response.refreshToken);
+              storage.set(AUTH_CONFIG.USER_KEY, response.user);
+              dispatch({
+                type: 'LOGIN_SUCCESS',
+                payload: {
+                  user: response.user,
+                  token: response.token,
+                  refreshToken: response.refreshToken,
+                },
+              });
+              console.log('Token refreshed successfully.');
+            } catch (refreshError) {
+              console.error('Refresh error:', refreshError);
+              dispatch({ type: 'LOGOUT' });
+            }
+          } else {
+            dispatch({
+              type: 'LOGIN_SUCCESS',
+              payload: {
+                user,
+                token,
+                refreshToken,
+              },
+            });
+            console.log('Token valid, session restored.');
+          }
+        } else {
+          console.log('No valid token/refreshToken/user found in storage. Logging out.');
+          dispatch({ type: 'LOGOUT' });
         }
       } catch (error) {
         console.error('Failed to initialize auth:', error);
+        dispatch({ type: 'LOGOUT' });
       } finally {
         dispatch({ type: 'SET_LOADING', payload: false });
       }
@@ -108,24 +147,22 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const login = async (credentials: LoginRequest) => {
     dispatch({ type: 'SET_LOADING', payload: true });
-    
     try {
       const response = await authService.login(credentials);
-      
-      // Store auth data
       storage.set(AUTH_CONFIG.TOKEN_KEY, response.token);
       storage.set(AUTH_CONFIG.REFRESH_TOKEN_KEY, response.refreshToken);
       storage.set(AUTH_CONFIG.USER_KEY, response.user);
-      
       if (credentials.rememberMe) {
         storage.set(AUTH_CONFIG.REMEMBER_ME_KEY, true);
       }
-
       dispatch({
         type: 'LOGIN_SUCCESS',
-        payload: response,
+        payload: {
+          user: response.user,
+          token: response.token,
+          refreshToken: response.refreshToken,
+        },
       });
-
       toast.success(`Welcome back, ${response.user.name || response.user.email}!`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Login failed';
@@ -138,20 +175,19 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const register = async (userData: RegisterRequest) => {
     dispatch({ type: 'SET_LOADING', payload: true });
-    
     try {
       const response = await authService.register(userData);
-      
-      // Store auth data
       storage.set(AUTH_CONFIG.TOKEN_KEY, response.token);
       storage.set(AUTH_CONFIG.REFRESH_TOKEN_KEY, response.refreshToken);
       storage.set(AUTH_CONFIG.USER_KEY, response.user);
-
       dispatch({
         type: 'LOGIN_SUCCESS',
-        payload: response,
+        payload: {
+          user: response.user,
+          token: response.token,
+          refreshToken: response.refreshToken,
+        },
       });
-
       toast.success('Account created successfully! Welcome aboard!');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Registration failed';
@@ -169,7 +205,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
       toast.success('Logged out successfully');
     } catch (error) {
       console.error('Logout error:', error);
-      // Still logout locally even if server request fails
       dispatch({ type: 'LOGOUT' });
     }
   };
@@ -179,16 +214,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
       if (!state.refreshToken) {
         throw new Error('No refresh token available');
       }
-
       const response = await authService.refreshToken(state.refreshToken);
-      
-      // Update stored auth data
       storage.set(AUTH_CONFIG.TOKEN_KEY, response.token);
       storage.set(AUTH_CONFIG.REFRESH_TOKEN_KEY, response.refreshToken);
-
       dispatch({
         type: 'LOGIN_SUCCESS',
-        payload: response,
+        payload: {
+          user: response.user,
+          token: response.token,
+          refreshToken: response.refreshToken,
+        },
       });
     } catch (error) {
       console.error('Token refresh failed:', error);
@@ -219,3 +254,5 @@ export function AuthProvider({ children }: AuthProviderProps) {
     </AuthContext.Provider>
   );
 }
+
+export const AuthContext = createContext<AuthContextType>({} as AuthContextType);
